@@ -138,6 +138,7 @@ services:
           - /input
         methods:
           - POST
+          - OPTIONS
         # strip_path: false = /input stays /input when Kong forwards to Node
         # strip_path: true  = Kong strips /input, Node would receive just /
         strip_path: false
@@ -153,6 +154,7 @@ services:
           - /output
         methods:
           - GET
+          - OPTIONS
         strip_path: false
         protocols:
           - http
@@ -165,6 +167,7 @@ services:
           - /debug
         methods:
           - GET
+          - OPTIONS
         strip_path: false
         protocols:
           - http
@@ -179,6 +182,7 @@ services:
           - /health
         methods:
           - GET
+          - OPTIONS
         strip_path: false
         protocols:
           - http
@@ -197,7 +201,6 @@ services:
     #  /health route is EXCLUDED from key-auth using the route_id trick below.
     # ──────────────────────────────────────────────────────────────────────────
     plugins:
-
       # ── Plugin 1: key-auth ─────────────────────────────────────────────────
       #
       #  What it does:
@@ -211,6 +214,11 @@ services:
       #  req.headers['x-consumer-username']   → "postman-tester"
       #  req.headers['x-consumer-custom-id']  → "dev-testing-001"
       # ──────────────────────────────────────────────────────────────────────
+      - name: cors
+        config:
+          origins:
+            - "*"
+
       - name: key-auth
         config:
           # Key can be sent as any of these header/query names:

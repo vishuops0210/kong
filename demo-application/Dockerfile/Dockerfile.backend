@@ -1,0 +1,11 @@
+FROM node:22-alpine AS prod
+WORKDIR /app
+COPY ./backend/package*.json ./
+RUN npm ci --omit=dev          # lean prod deps installed here
+COPY . .
+
+# ✅ Copy only app source, NOT node_modules from builder
+COPY ./backend ./
+
+EXPOSE 3000
+CMD ["node", "app.js"]

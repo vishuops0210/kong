@@ -1,0 +1,52 @@
+services:
+# this compose is only for testing purpose don't use it in production ever.
+  # Backend Application
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile/Dockerfile.backend
+      target: prod
+
+    container_name: backend
+    ports:
+      - 3000:3000
+    networks:
+      - demo
+
+    restart: unless-stopped
+
+    mem_limit: 512m
+    cpus: 0.5
+
+
+  # Frontend React Application
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile/Dockerfile.frontend
+      target: prod
+
+      args:
+        REACT_APP_KONG_URL: http://13.232.44.175:8000
+        REACT_APP_KONG_KEY: frontend-key-xyz789
+
+    container_name: frontend
+
+    ports:
+      - "80:80"
+
+    networks:
+      - demo
+
+    depends_on:
+      - backend
+
+    restart: unless-stopped
+
+    mem_limit: 512m
+    cpus: 0.5
+
+
+networks:
+  demo:
+    driver: bridge
