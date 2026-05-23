@@ -1,4 +1,4 @@
 demo.md
 implementation.md
-application/node_modules/
-kong-react-app/node_modules/
+demo-application/backend/node_modules/
+demo-application/frontend/node_modules/
