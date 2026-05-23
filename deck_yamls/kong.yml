@@ -1,0 +1,306 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+#  kong-config.yaml  —  Your ENTIRE Kong setup in one file
+#  Apply with:  deck gateway sync kong-config.yaml
+#  Preview with: deck gateway diff kong-config.yaml
+#  This file lives in Git. Every change is tracked. No random curl commands.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_format_version: "3.0"
+
+# ───────────────────────────────────────────────────────────────────────────────
+#  UPSTREAMS  (the load balancer)
+#
+#  Think of Upstream as the "pool" of your Node app instances.
+#  Right now you have 1 container. When you scale to 2 or 3,
+#  you just add more targets here — Kong handles the rest automatically.
+#
+#  Service (below) will point to this upstream by name instead of a direct URL.
+#  That's how Kong knows to load balance.
+# ───────────────────────────────────────────────────────────────────────────────
+upstreams:
+  - name: nodejs-demo-upstream
+    # round-robin = request 1 → container1, request 2 → container2, request 3 → container1...
+    # other options: least-connections, consistent-hashing
+    algorithm: round-robin
+
+    # slots = how fine-grained the load balancing ring is
+    # 100 is fine for 2-3 targets. Increase for more targets.
+    slots: 100
+
+    healthchecks:
+      # ACTIVE health check = Kong proactively pings /health every N seconds
+      # Even when no real traffic is coming, Kong checks if your app is alive
+      active:
+        type: http
+        http_path: /health         # Kong hits GET /health on each container
+        timeout: 5                 # wait max 5 seconds for a response
+        concurrency: 5             # check up to 5 targets in parallel
+
+        healthy:
+          interval: 10             # ping every 10 seconds when container is UP
+          successes: 2             # need 2 consecutive 200s to mark as HEALTHY
+
+        unhealthy:
+          interval: 5              # ping every 5 seconds when container is DOWN
+          http_failures: 3         # 3 consecutive failures = mark as UNHEALTHY
+          tcp_failures: 3          # 3 TCP failures (port refused) = UNHEALTHY
+          http_statuses:
+            - 500
+            - 502
+            - 503
+            - 504
+
+      # PASSIVE health check = Kong watches real traffic responses
+      # No extra pings — it learns from actual requests going through
+      passive:
+        type: http
+
+        healthy:
+          successes: 5             # 5 consecutive 2xx = mark as HEALTHY again
+          http_statuses:
+            - 200
+            - 201
+
+        unhealthy:
+          http_failures: 5         # 5 consecutive failures = UNHEALTHY
+          tcp_failures: 3
+          http_statuses:
+            - 500
+            - 502
+            - 503
+
+    # ── TARGETS: your actual Node.js container instances ──────────────────────
+    #
+    #  RIGHT NOW (1 container):
+    #  Docker exposes your container on host port 3000.
+    #  Kong (on bare metal) reaches it at 127.0.0.1:3000
+    #
+    #  WHEN YOU SCALE TO 2 CONTAINERS:
+    #  Run second container on host port 3001
+    #  Just uncomment the second target below and run: deck gateway sync
+    #  Kong immediately starts splitting traffic. Zero restart needed.
+    #
+    #  WHEN YOU SCALE TO 3:
+    #  Add a third target at 127.0.0.1:3002. Same thing.
+    #
+    #  weight: 100 = equal weight. All containers get same share of traffic.
+    #  weight: 200 on one = that container gets double the traffic of others.
+    targets:
+      - target: 127.0.0.1:3000
+        weight: 100
+
+      # Uncomment when you run a second container on port 3001:
+      # - target: 127.0.0.1:3001
+      #   weight: 100
+
+      # Uncomment when you run a third container on port 3002:
+      # - target: 127.0.0.1:3002
+      #   weight: 100
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+#  SERVICES  (your backend app registered with Kong)
+#
+#  A Service = "Kong, there's a backend app. Here's its address."
+#  Kong stores this in PostgreSQL so it survives restarts.
+#
+#  Notice: host is "nodejs-demo-upstream" — NOT 127.0.0.1:3000 directly.
+#  By pointing to the upstream name, Kong load balances automatically.
+#  If you had pointed to 127.0.0.1:3000 directly, it's just one target — no LB.
+# ───────────────────────────────────────────────────────────────────────────────
+services:
+  - name: nodejs-demo
+    # host = the upstream name (not a direct IP)
+    # Kong sees this name, looks it up in upstreams above, gets the target list
+    host: nodejs-demo-upstream
+    port: 80
+    protocol: http
+
+    # Timeouts in milliseconds
+    connect_timeout: 60000    # how long Kong waits to open TCP to your Node app
+    read_timeout: 60000       # how long Kong waits for Node app to send a response
+    write_timeout: 60000      # how long Kong waits to finish sending request to Node
+    retries: 3                # if Node app fails, try this many times before giving up
+
+    # ── ROUTES ────────────────────────────────────────────────────────────────
+    #
+    #  Route = "Kong, when a request matches these rules, send it to THIS service."
+    #  You can have multiple routes per service (one per endpoint, or grouped).
+    #  We use separate routes here so we can see each endpoint clearly.
+    #  We also have a /health route with NO auth — Kong needs to probe it freely.
+    # ──────────────────────────────────────────────────────────────────────────
+    routes:
+
+      # Route 1 — POST /input
+      # Your endpoint that receives { "message": "hi" }
+      - name: input-route
+        paths:
+          - /input
+        methods:
+          - POST
+        # strip_path: false = /input stays /input when Kong forwards to Node
+        # strip_path: true  = Kong strips /input, Node would receive just /
+        strip_path: false
+        preserve_host: false   # Kong uses its own host header (not client's)
+        protocols:
+          - http
+          - https
+
+      # Route 2 — GET /output
+      # Your endpoint that returns { "message": "hi" }
+      - name: output-route
+        paths:
+          - /output
+        methods:
+          - GET
+        strip_path: false
+        protocols:
+          - http
+          - https
+
+      # Route 3 — GET /debug/headers
+      # Shows all Kong-injected headers — great for understanding
+      - name: debug-route
+        paths:
+          - /debug
+        methods:
+          - GET
+        strip_path: false
+        protocols:
+          - http
+          - https
+
+      # Route 4 — GET /health  (NO auth plugin here — open to Kong's health checker)
+      # Kong's active health checker hits this directly.
+      # If we put key-auth on it, Kong's own health probes would fail (no key).
+      # So this route is intentionally left without the key-auth plugin.
+      - name: health-route
+        paths:
+          - /health
+        methods:
+          - GET
+        strip_path: false
+        protocols:
+          - http
+          - https
+
+    # ── PLUGINS (attached to the nodejs-demo service) ─────────────────────────
+    #
+    #  Plugins run on EVERY request to this service, in priority order.
+    #  Think of them as middleware — but Kong runs them, not your Node app.
+    #
+    #  Order they actually run (highest priority number first):
+    #  1. key-auth       (priority 1003) — is this caller allowed?
+    #  2. rate-limiting  (priority 901)  — are they spamming?
+    #  3. response-transformer (priority 100) — clean up the response
+    #
+    #  /health route is EXCLUDED from key-auth using the route_id trick below.
+    # ──────────────────────────────────────────────────────────────────────────
+    plugins:
+
+      # ── Plugin 1: key-auth ─────────────────────────────────────────────────
+      #
+      #  What it does:
+      #  Every request must include a valid API key.
+      #  Kong checks it against the consumers list below.
+      #  No key → 401 Unauthorized (request NEVER reaches Node)
+      #  Wrong key → 401 Unauthorized
+      #  Valid key → Kong injects X-Consumer-* headers and forwards to Node
+      #
+      #  Your Node app reads these injected headers:
+      #  req.headers['x-consumer-username']   → "postman-tester"
+      #  req.headers['x-consumer-custom-id']  → "dev-testing-001"
+      # ──────────────────────────────────────────────────────────────────────
+      - name: key-auth
+        config:
+          # Key can be sent as any of these header/query names:
+          key_names:
+            - apikey        # header: apikey: abc123
+            - x-api-key     # header: x-api-key: abc123
+          key_in_header: true    # accept key in request headers (recommended)
+          key_in_query: true     # accept key as ?apikey=abc123 (less secure, for testing)
+          key_in_body: false     # never accept key in body (appears in logs)
+          # hide_credentials: true = Kong STRIPS the key before forwarding to Node
+          # Your Node app never sees raw API keys. Security best practice.
+          hide_credentials: true
+
+      # ── Plugin 2: rate-limiting ────────────────────────────────────────────
+      #
+      #  What it does:
+      #  Counts requests per consumer. If they exceed the limit, Kong returns
+      #  429 Too Many Requests — your Node app never even sees those requests.
+      #
+      #  limit_by: consumer = each consumer gets their OWN bucket.
+      #  postman-tester gets 10/min. web-frontend gets 10/min. Independently.
+      #  If postman-tester hits the limit, web-frontend is unaffected.
+      # ──────────────────────────────────────────────────────────────────────
+      - name: rate-limiting
+        config:
+          minute: 10             # max 10 requests per minute per consumer
+          hour: 200              # max 200 per hour per consumer
+          policy: local          # counters in Kong's memory (fast, no Redis needed)
+                                 # change to "redis" when you run multiple Kong nodes
+          limit_by: consumer     # each consumer has their own counter
+          hide_client_headers: false  # send X-RateLimit-* headers to client (informative)
+          fault_tolerant: true   # if counter fails, let requests through (don't block users)
+
+      # ── Plugin 3: response-transformer ────────────────────────────────────
+      #
+      #  What it does:
+      #  Modifies the response BEFORE it reaches the client.
+      #  Runs AFTER Node app responds. Kong intercepts and cleans it up.
+      #
+      #  We use it to:
+      #  1. Remove headers that reveal your tech stack (hide from attackers)
+      #  2. Add security headers to every response
+      # ──────────────────────────────────────────────────────────────────────
+      - name: response-transformer
+        config:
+          remove:
+            headers:
+              - X-Powered-By    # removes "X-Powered-By: Express" — don't advertise stack
+              - Server          # removes "Server: nginx" or similar
+          add:
+            headers:
+              - "X-Content-Type-Options:nosniff"   # prevents MIME sniffing attacks
+              - "X-Frame-Options:DENY"             # prevents clickjacking
+              - "X-XSS-Protection:1; mode=block"  # enables browser XSS filter
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+#  CONSUMERS  (who is allowed to call your API)
+#
+#  A Consumer = a name + an API key.
+#  It represents a CALLER — not an end user.
+#
+#  Real world mapping for YOUR app right now:
+#
+#  postman-tester  →  YOU testing from Postman on your laptop
+#  web-frontend    →  imagine this is a React app or partner calling your API
+#
+#  Kong uses the key to:
+#  1. Identify WHO is calling
+#  2. Rate limit them individually
+#  3. Inject X-Consumer-* headers so your Node app knows who called it
+#
+#  Your Node app already reads these:
+#    req.headers['x-consumer-username']   ← "postman-tester"
+#    req.headers['x-consumer-custom-id']  ← "dev-testing-001"
+#
+#  In production: generate keys randomly, store in a secrets manager.
+#  Never hardcode real production keys in this file.
+# ───────────────────────────────────────────────────────────────────────────────
+consumers:
+
+  # Consumer 1: You, testing from Postman
+  - username: postman-tester
+    custom_id: dev-testing-001      # your own internal ID — can be anything
+    keyauth_credentials:
+      - key: postman-key-abc123     # you'll send this in Postman as header: apikey: postman-key-abc123
+
+  # Consumer 2: Simulating a frontend / second caller
+  # Useful to see how Kong tracks them separately in rate limiting
+  - username: web-frontend
+    custom_id: frontend-app-001
+    keyauth_credentials:
+      - key: frontend-key-xyz789    # a different app gets a different key
