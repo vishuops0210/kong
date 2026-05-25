@@ -1,0 +1,426 @@
+## PHASE 2 — Register Your Apps with Kong
+
+This phase is **identical regardless of which approach you used in Phase 1.**
+
+EC2, EKS, or Fargate — it does not matter.
+Kong is running. Now you tell it where your apps live.
+The apps themselves are not touched. Not redeployed. Not modified.
+
+```
+Your app is running somewhere:
+  → Same EKS cluster (K8s Service DNS)
+  → Different EC2 (IP address)
+  → Another AWS account (private link endpoint)
+  → On-prem (VPN-connected IP)
+  → Anywhere reachable from Kong's network
+
+You write a kong.yml describing it.
+You run deck sync.
+Kong starts routing to it immediately.
+```
+
+### The kong.yml — Telling Kong About Your App
+
+```yaml
+# kong.yml
+# This file lives in Git.
+# Apply with:   deck gateway sync kong.yml
+# Preview with: deck gateway diff kong.yml
+# Validate:     deck gateway validate kong.yml
+
+_format_version: "3.0"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UPSTREAM — the load balancer pool for your app
+#
+# target can be:
+#   → an IP:port          (bare metal or EC2)
+#   → a DNS name:port     (K8s Service, Cloud Map, Route 53)
+#   → a hostname:port     (anything DNS-resolvable from Kong's network)
+#
+# Kong resolves DNS per request.
+# App scales up → DNS updates → Kong picks up new instances automatically.
+# No deck sync needed when your app scales.
+# ─────────────────────────────────────────────────────────────────────────────
+upstreams:
+  - name: my-app-upstream
+    algorithm: round-robin
+    slots: 100
+
+    healthchecks:
+      active:
+        type: http
+        http_path: /health          # Kong pings this on each target every 10s
+        timeout: 5
+        healthy:
+          interval: 10
+          successes: 2
+        unhealthy:
+          interval: 5
+          http_failures: 3
+          tcp_failures: 3
+
+      passive:
+        type: http
+        healthy:
+          successes: 5
+          http_statuses: [200, 201]
+        unhealthy:
+          http_failures: 5
+          http_statuses: [500, 502, 503, 504]
+
+    targets:
+      # If your app is on EC2 or bare metal — use IP:port
+      - target: 10.0.1.50:3000
+        weight: 100
+
+      # If your app is on Kubernetes — use Service DNS
+      # - target: my-app-service.my-namespace.svc.cluster.local:80
+      #   weight: 100
+
+      # Scale to 3 instances? Just add targets. deck sync. Done.
+      # - target: 10.0.1.51:3000
+      #   weight: 100
+      # - target: 10.0.1.52:3000
+      #   weight: 100
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SERVICE — register your app with Kong
+# ─────────────────────────────────────────────────────────────────────────────
+services:
+  - name: my-app
+    host: my-app-upstream     # points to the upstream above — enables load balancing
+    port: 80
+    protocol: http
+    connect_timeout: 60000
+    read_timeout: 60000
+    write_timeout: 60000
+    retries: 3
+
+    routes:
+      - name: my-app-route
+        paths:
+          - /api
+        methods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - OPTIONS
+        strip_path: false
+        protocols:
+          - http
+          - https
+
+    plugins:
+      # Auth — every request must carry a valid JWT
+      - name: jwt
+        config:
+          key_claim_name: iss
+          claims_to_verify:
+            - exp
+          hide_credentials: true    # strip JWT before forwarding to your app
+
+      # Rate limiting — shared counter across all Kong nodes via Redis
+      - name: rate-limiting
+        config:
+          minute: 60
+          hour: 1000
+          policy: redis
+          limit_by: consumer
+          redis:
+            host: your-elasticache-endpoint.cache.amazonaws.com
+            port: 6379
+            ssl: true
+          fault_tolerant: true
+          hide_client_headers: false
+
+      # Security headers — strip stack info, add protection headers
+      - name: response-transformer
+        config:
+          remove:
+            headers:
+              - X-Powered-By
+              - Server
+          add:
+            headers:
+              - "X-Content-Type-Options:nosniff"
+              - "X-Frame-Options:DENY"
+              - "X-XSS-Protection:1; mode=block"
+
+      # Logging — ship every request to your log collector
+      - name: http-log
+        config:
+          http_endpoint: http://your-log-collector:8080/logs
+          method: POST
+          timeout: 1000
+          keepalive: 1000
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSUMERS — who is allowed to call your API
+# Each caller gets their own JWT credential and their own rate limit bucket.
+# ─────────────────────────────────────────────────────────────────────────────
+consumers:
+  - username: web-frontend
+    custom_id: frontend-app-001
+    jwt_secrets:
+      - key: frontend-issuer
+        secret: "pull-this-from-vault-never-hardcode"
+
+  - username: mobile-app
+    custom_id: mobile-app-001
+    jwt_secrets:
+      - key: mobile-issuer
+        secret: "pull-this-from-vault-never-hardcode"
+
+  - username: internal-service
+    custom_id: internal-svc-001
+    jwt_secrets:
+      - key: internal-issuer
+        secret: "pull-this-from-vault-never-hardcode"
+```
+
+### Apply the Config
+
+```bash
+# EKS — port-forward admin API then sync
+kubectl port-forward svc/kong-kong-admin 8001:8001 -n kong &
+deck gateway sync kong.yml --kong-addr http://localhost:8001
+
+# EC2 — admin API is on 127.0.0.1:8001 on the node, reach via bastion
+ssh -L 8001:localhost:8001 ec2-user@<bastion-ip>
+deck gateway sync kong.yml --kong-addr http://localhost:8001
+
+# ECS — use VPC endpoint or bastion to reach admin task
+deck gateway sync kong.yml --kong-addr http://<internal-alb-for-admin>:8001
+```
+
+### Verify Routing Works
+
+```bash
+export KONG=http://<your-kong-alb-dns>
+
+# No token — Kong blocks it before it reaches your app
+curl $KONG/api/users
+# {"message":"Unauthorized"}  ← 401, Kong rejected it
+
+# With a valid JWT
+curl $KONG/api/users \
+  -H "Authorization: Bearer <your-jwt-token>"
+# Your app's response — Kong routed it, authenticated it, logged it
+
+# Hit rate limit (after 60 requests in a minute)
+# {"message":"API rate limit exceeded"}  ← 429, Kong blocked it
+
+# Your app never saw the blocked requests.
+# Your app never validated the JWT.
+# Your app never wrote a single log line for this.
+# Kong handled all of it.
+```
+
+### What Kong Injects Into Your App's Request
+
+After JWT validation passes, Kong adds these headers before forwarding to your app:
+
+```
+X-Consumer-Username:  web-frontend
+X-Consumer-Custom-Id: frontend-app-001
+X-Forwarded-For:      <real client IP>
+X-Forwarded-Host:     api.yourcompany.com
+X-Forwarded-Proto:    https
+```
+
+Your app reads `X-Consumer-Username` to know which caller it is.
+Your app reads `X-Forwarded-For` to know the real client IP.
+The JWT itself is stripped — your app never sees the raw token.
+
+---
+
+## 3. GitOps — How Config Changes Reach Kong
+
+No one runs `deck sync` from their laptop. Ever.
+
+```
+Developer edits kong.yml
+        │
+        ▼
+git push → Pull Request opened
+        │
+        ▼
+CI runs:
+  deck gateway validate kong.yml     ← is the YAML valid?
+  deck gateway diff                  ← what exactly will change?
+        │
+        ▼
+Team reviews the diff in the PR
+        │
+        ▼
+PR merged to main
+        │
+        ▼
+CD runs:
+  deck gateway sync kong.yml
+        │
+        ▼
+Kong Admin API receives changes
+        │
+        ▼
+PostgreSQL updated
+        │
+        ▼
+All Kong nodes pick up new config within seconds
+        │
+        ▼
+Zero downtime. Zero restarts. Full audit trail in Git.
+```
+
+```yaml
+# .github/workflows/kong-sync.yml
+name: Kong Config Sync
+on:
+  push:
+    branches: [main]
+    paths: ['kong.yml']
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install decK
+        run: |
+          curl -sL https://github.com/kong/deck/releases/download/v1.37.0/deck_1.37.0_linux_amd64.tar.gz -o deck.tar.gz
+          tar -xf deck.tar.gz -C /tmp && sudo cp /tmp/deck /usr/local/bin/
+
+      - name: Validate
+        run: deck gateway validate kong.yml
+
+      - name: Diff
+        run: deck gateway diff kong.yml --kong-addr ${{ secrets.KONG_ADMIN_URL }}
+
+      - name: Sync
+        run: deck gateway sync kong.yml --kong-addr ${{ secrets.KONG_ADMIN_URL }}
+```
+
+`KONG_ADMIN_URL` is a GitHub secret pointing to the internal admin endpoint.
+Port 8001 is never exposed to the internet.
+
+---
+
+## 5. The Recommendation
+
+```
+EC2 + ALB + ASG
+  Works. But scaling takes 3–5 minutes.
+  Self-healing is slow. Rolling updates are manual.
+  Right choice only if the team is not ready for Kubernetes.
+
+ECS Fargate
+  Zero node management — AWS handles the infra.
+  Scales in ~30 seconds. Native Secrets Manager integration.
+  Good stepping stone. But no Helm, no K8s RBAC, no PDB,
+  limited observability without extra setup.
+
+EKS + HPA  ← THE ANSWER
+  Kong pods scale in ~10 seconds on a traffic spike.
+  Pod crashes → Kubernetes restarts in ~10 seconds.
+  AZ fails → 2 pods in other AZs keep serving, HPA adds replacements.
+  helm upgrade → rolling update → zero downtime guaranteed by PDB.
+  helm rollback → one command, ~30 seconds to previous version.
+  K8s DNS → app scaling is invisible to Kong, no deck sync needed.
+  K8s RBAC → fine-grained access control per team per namespace.
+  Prometheus sidecar → metrics out of the box.
+  GitOps → Helm values + kong.yml both in Git, CI/CD applies both.
+  35 out of 36 checklist items satisfied.
+
+The system manages itself.
+You set it up once. It runs.
+```
+
+---
+
+## 6. HA, RTO & RPO
+
+```
+┌──────────────────────┬────────────────────────────────────────────────────┐
+│ Failure              │ EKS Response                                       │
+├──────────────────────┼────────────────────────────────────────────────────┤
+│ Kong pod crashes     │ K8s restarts pod. RTO: ~10 seconds.                │
+│ AZ goes down         │ 2 pods in other AZs keep serving.                  │
+│                      │ HPA adds replacement pods. RTO: ~30 seconds.       │
+│ RDS primary fails    │ Multi-AZ auto-failover. Same DNS endpoint.         │
+│                      │ Kong reconnects. RTO: ~60 seconds.                 │
+│                      │ Kong serves from memory cache during failover.     │
+│ Redis fails          │ fault_tolerant:true — requests pass through.       │
+│                      │ Rate limits briefly unenforced. RTO: ~30 seconds.  │
+│ Full cluster failure │ Restore from RDS snapshot. RTO: ~15 minutes.      │
+├──────────────────────┼────────────────────────────────────────────────────┤
+│ Agreed RTO           │ < 5 minutes for pod/AZ failure                     │
+│ Agreed RPO           │ < 5 minutes (RDS automated backups every 5 min)    │
+└──────────────────────┴────────────────────────────────────────────────────┘
+```
+
+### Firedrill Schedule
+
+```
+Quarterly  → kubectl delete pod <kong-pod>
+             Expected: pod restarts in 10s, zero traffic drop
+             Evidence: kubectl get pods showing restart + timestamp
+
+Semi-annual → cordon + drain one AZ's nodes
+              Expected: traffic continues via other 2 AZs
+              Evidence: ALB access logs showing zero dropped requests
+
+Annual     → trigger RDS Multi-AZ failover
+             Expected: Kong reconnects within 60s
+             Evidence: Kong error logs showing reconnect timestamp
+
+Annual     → full restore from RDS snapshot to new instance
+             Expected: full config restored, deck diff shows zero drift
+```
+
+---
+
+## 7. Incident Management
+
+### Severity Classification
+
+```
+SEV-1  Kong completely unreachable. All APIs down.
+       Response: 15 min. Escalation: On-call → Lead → Manager.
+
+SEV-2  Kong degraded. Error rate > 5% or P99 latency > 1s.
+       Response: 30 min. Escalation: On-call → Lead.
+
+SEV-3  Single route broken. Other routes unaffected.
+       Response: 2 hours. Escalation: On-call.
+
+SEV-4  Config drift detected. No user impact.
+       Response: Next business day.
+```
+
+### Communication Template
+
+```
+[SEV-X] Kong API Gateway — <short description>
+
+Status:      Investigating / Identified / Monitoring / Resolved
+Impact:      <which routes affected, estimated user count>
+Start time:  <UTC timestamp>
+Update:      <what we know, what we are doing>
+Next update: in <N> minutes
+
+Incident commander: <name>
+```
+
+### Post-Incident RCA Template
+
+```
+Summary, Timeline (UTC), Root Cause, Contributing Factors,
+Impact (duration + affected routes + user count),
+What went well, What went wrong,
+Action items (owner + due date), Preventive measures.
+
+Conducted within 48 hours of resolution.
+```
